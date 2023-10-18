@@ -24,12 +24,17 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = []
+dependencies = [
+  "click=8.1.7"
+]
 
 [project.urls]
 Documentation = "https://github.com/unknown/ftp-scan#readme"
 Issues = "https://github.com/unknown/ftp-scan/issues"
 Source = "https://github.com/unknown/ftp-scan"
+
+[project.scripts]
+ftp-scan = "ftp_scan.cli:main_cli"
 
 [tool.hatch.version]
 path = "src/ftp_scan/__about__.py"
