@@ -25,7 +25,9 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "click=8.1.7"
+  "click~=8.1.7",
+  "regex~=2023.10.3",
+  "loguru~=0.7.2"
 ]
 
 [project.urls]
