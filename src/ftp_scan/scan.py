@@ -23,6 +23,7 @@ import sqlite3
 from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
 UnixDirRegex = re.compile(r"^(?<inode_type>\S)(?<permissions>(?:[r-][w-][xs-]){3})\s+[0-9]+\s(?<user>\S+)\s+(?<group>\S+)\s+(?<size>\S+)\s+(?<month>\w{3})\s+(?<day>\d{1,2})\s+((?<year>\d{4})|(?<hour>\d{1,2}):(?<minute>\d{1,2}))\s+(?<filename>.*\S)\s*$")
+UnixDirRegex_SymLink = re.compile(r"^(?<source>.*\S) -> (?<target>.*\S)$")
 
 MsDosDirRegex = re.compile(r"^(?<month>[0-9]{2})-(?<day>[0-9]{2})-(?<year>[0-9]{2})\s+(?<hour>[0-9]{2}):(?<minute>[0-9]{2})(?<ampm>AM|PM)\s+(?<inode_type><DIR>)?\s+(?<size>\d+)?\s+(?<filename>.*\S)\s*$")
 
@@ -63,7 +64,7 @@ class FileNode:
     extra: Optional[str] = None
 
     @abstractproperty
-    def is_dir(self) -> bool:
+    def is_dir(self) -> Optional[bool]:
         pass
 
     @abstractmethod
@@ -122,6 +123,23 @@ class FileNode:
                     ans = RegularFile(path=working_path / filename, modification_date=mod_date, size=filesize)
                     ans.guess_mime()
                     return ans
+                elif inode_type == 'l':
+                    m = UnixDirRegex_SymLink.match(filename)
+                    assert m is not None
+                    filename = m.groupdict()['source']
+                    target = PurePosixPath(m.groupdict()['target'])
+                    # logger.debug(target)
+                    if not target.is_absolute():
+                        target = working_path / target
+                        # logger.debug(target)
+                        try:
+                            target = target.relative_to('/', walk_up=True)
+                        except:
+                            target = target.relative_to('/')
+                        # logger.debug(target)
+                        target = PurePosixPath('/') / target
+                    # logger.debug(target)
+                    return SymbolicLink(working_path / filename, mod_date, target=target)
                 else:
                     logger.error("Unsupported node type: "+inode_type)
                     return None
@@ -184,6 +202,24 @@ class RegularFile(FileNode):
         cur.execute("CREATE TABLE IF NOT EXISTS files (path PRIMARY KEY, mime, size, modification_date, extra, error_msg);")
 
 @dataclass
+class SymbolicLink(FileNode):
+    target: Optional[PurePosixPath] = None
+
+    @property
+    def is_dir(self) -> Optional[bool]:
+        return None
+
+    def to_sqlite_tuple(self) -> Tuple:
+        return (str(self.path), str(self.target), self.modification_date, self.extra, self.error_msg)
+
+    def save(self, cur: sqlite3.Cursor):
+        cur.execute("REPLACE INTO links (path, target, modification_date, extra, error_msg) VALUES (?, ?, ?, ?, ?);", self.to_sqlite_tuple())
+
+    @staticmethod
+    def create_table(cur: sqlite3.Cursor):
+        cur.execute("CREATE TABLE IF NOT EXISTS links (path PRIMARY KEY, target, modification_date, extra, error_msg);")
+
+@dataclass
 class Directory(FileNode):
     num_children: Optional[int] = None
 
@@ -233,7 +269,7 @@ class FTPScanner:
         netloc += f':{addr.port}' if addr.port is not None else ''
         if addr.scheme == 'ftp':
             self.ftp = FTP(netloc, username, password, encoding=encoding, source_address=source_address, timeout=timeout)
-        elif addr.scheme == 'sftp':
+        elif addr.scheme == 'ftps':
             self.ftp = FTP_TLS(netloc, username, password, encoding=encoding, source_address=source_address, timeout=timeout)
         else:
             raise ValueError(f'not an FTP scheme: {addr.scheme}')
@@ -241,7 +277,7 @@ class FTPScanner:
         logger.info(f"Logging in as {username}")
         if addr.scheme == 'ftp':
             self.ftp.login()
-        if addr.scheme == 'sftp':
+        if addr.scheme == 'ftps':
             self.ftp.prot_p()
         logger.info(f"opening SQLite database at {sqlite_path}")
         self.con = sqlite3.connect(sqlite_path)
@@ -249,6 +285,7 @@ class FTPScanner:
         cur = self.con.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS general (key PRIMARY KEY, value);")
         RegularFile.create_table(cur)
+        SymbolicLink.create_table(cur)
         Directory.create_table(cur)
         cur.close()
         self.con.commit()
