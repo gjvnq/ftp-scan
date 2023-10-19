@@ -173,9 +173,9 @@ class FTPScanner:
     flavour: Optional[FTPFlavour]
 
     def __init__(self, ftp_addr: str, password: str, sqlite_path: str|Path, encoding: str="utf8"):
-        addr = urlparse(ftp_addr)
-        if addr.scheme == '':
-            addr.scheme = 'ftp'
+        addr = urlparse(ftp_addr, scheme='ftp')
+        if addr.netloc == '':
+            addr = addr._replace(netloc=addr.path, path='')
         logger.info(f"Connecting to {urlunparse(addr)}")
         self.ftp = FTP(addr.netloc, addr.username, password, encoding=encoding)
         logger.info(f"Logging as {addr.username}")
