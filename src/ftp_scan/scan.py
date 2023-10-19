@@ -6,23 +6,25 @@ from abc import abstractmethod, abstractproperty
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from ftplib import FTP
+from ftplib import FTP, FTP_TLS
 import ftplib
+import json
 import mimetypes
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, urlunparse
 import regex as re
 from loguru import logger
 import sqlite3
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
-UnixDirRegex = re.compile(r"^(?<inode_type>\S)(?<permissions>(?:[r-][w-][x-]){3})\s+[0-9]+\s(?<user>\S+)\s+(?<group>\S+)\s+(?<size>\S+)\s+(?<month>\w{3})\s+(?<day>\d{1,2})\s+((?<year>\d{4})|(?<hour>\d{1,2}):(?<minute>\d{1,2}))\s+(?<filename>.*\S)\s*$")
+UnixDirRegex = re.compile(r"^(?<inode_type>\S)(?<permissions>(?:[r-][w-][xs-]){3})\s+[0-9]+\s(?<user>\S+)\s+(?<group>\S+)\s+(?<size>\S+)\s+(?<month>\w{3})\s+(?<day>\d{1,2})\s+((?<year>\d{4})|(?<hour>\d{1,2}):(?<minute>\d{1,2}))\s+(?<filename>.*\S)\s*$")
 
 MsDosDirRegex = re.compile(r"^(?<month>[0-9]{2})-(?<day>[0-9]{2})-(?<year>[0-9]{2})\s+(?<hour>[0-9]{2}):(?<minute>[0-9]{2})(?<ampm>AM|PM)\s+(?<inode_type><DIR>)?\s+(?<size>\d+)?\s+(?<filename>.*\S)\s*$")
 
 class FTPFlavour(StrEnum):
-    Unix = 'Unix'
-    MsDos = 'MsDos'
+    Unix = 'unix'
+    MsDos = 'ms-dos'
+    Mlsd = 'mlsd'
 
 month2num = {
     'Jan': 1,
@@ -39,11 +41,21 @@ month2num = {
     'Dec': 12
 }
 
+def parse_ftp_date(date_str: Optional[str]) -> Optional[datetime]:
+    if date_str is None:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y%m%d%H%M%S")
+    except Exception as e:
+        logger.warning(f'Failed to parse date: {date_str}')
+        return None
+
 @dataclass
 class FileNode:
     path: PurePosixPath
     modification_date: Optional[datetime] = None
     error_msg: Optional[str] = None
+    extra: Optional[str] = None
 
     @abstractproperty
     def is_dir(self) -> bool:
@@ -58,8 +70,27 @@ class FileNode:
         pass
 
     @staticmethod
-    def new_from_dir_line(flavour: FTPFlavour, path: PurePosixPath, line: str) -> FileNode:
-        with logger.contextualize(line=line):
+    def new_from_mlsd_line(flavour: FTPFlavour, working_path: PurePosixPath, entry: Tuple[str, Dict[str]]) -> FileNode:
+        with logger.contextualize(wd=working_path, entry=entry):
+            filename, entry = entry
+            mod_date = parse_ftp_date(entry.get('modify', None))
+            entry_as_json = json.dumps(entry)
+            filesize = entry.get('size', None)
+            filesize = int(filesize) if filesize is not None else None
+            if entry['type'] == 'file':
+                ans = RegularFile(path=working_path / filename, modification_date=mod_date, extra=entry_as_json, size=filesize)
+                ans.guess_mime()
+                return ans
+            elif entry['type'] in ['cdir', 'pdir', 'dir']:
+                return Directory(path=working_path / filename, modification_date=mod_date, extra=entry_as_json)
+            else:
+                logger.error("Unsupported node type: "+entry['type'])
+                return None
+
+
+    @staticmethod
+    def new_from_dir_line(flavour: FTPFlavour, working_path: PurePosixPath, line: str) -> FileNode:
+        with logger.contextualize(wd=working_path, line=line):
             if flavour == FTPFlavour.Unix:
                 m = UnixDirRegex.match(line)
                 assert m is not None
@@ -77,14 +108,18 @@ class FileNode:
                         minute = int(m.groupdict()['minute'])
                         mod_date = datetime(year, month2num[m.groupdict()['month']], day, hour, minute)
                 except Exception as e:
-                    logger.opt(exception=True).warning(f'Failed to parse date in: {str(e)}')
+                    logger.opt(exception=True).warning(f'Failed to parse date: {str(e)}')
                 inode_type = m.groupdict()['inode_type']
                 if inode_type == 'd':
-                    return Directory(path / filename, mod_date, None, None)
+                    return Directory(working_path / filename, mod_date, None, None)
                 elif inode_type == '-':
-                    ans = RegularFile(path / filename, mod_date, None, None, m.groupdict()['size'])
+                    filesize = int(m.groupdict()['size'])
+                    ans = RegularFile(path=working_path / filename, modification_date=mod_date, size=filesize)
                     ans.guess_mime()
                     return ans
+                else:
+                    logger.error("Unsupported node type: "+inode_type)
+                    return None
             elif flavour == FTPFlavour.MsDos:
                 m = MsDosDirRegex.match(line)
                 assert m is not None
@@ -110,13 +145,16 @@ class FileNode:
 
                     mod_date = datetime(year, month, day, hour, minute)
                 except Exception as e:
-                    logger.opt(exception=True).warning(f'Failed to parse date in: {str(e)}')
+                    logger.opt(exception=True).warning(f'Failed to parse date: {str(e)}')
                 if m.groupdict()['inode_type'] == '<DIR>':
-                    return Directory(path / filename, mod_date, None, None)
+                    return Directory(working_path / filename, mod_date, None, None)
                 else:
-                    ans = RegularFile(path / filename, mod_date, None, None, m.groupdict()['size'])
+                    filesize = int(m.groupdict()['size'])
+                    ans = RegularFile(path=working_path / filename, modification_date=mod_date, size=filesize)
                     ans.guess_mime()
                     return ans
+            else:
+                raise ValueError("unsupported flavour: "+flavour)
 
 @dataclass
 class RegularFile(FileNode):
@@ -131,14 +169,14 @@ class RegularFile(FileNode):
         self.mime = mimetypes.guess_type(self.path)[0]
 
     def to_sqlite_tuple(self) -> Tuple:
-        return (str(self.path), self.mime, self.size, self.modification_date, self.error_msg)
+        return (str(self.path), self.mime, self.size, self.modification_date, self.extra, self.error_msg)
 
     def save(self, cur: sqlite3.Cursor):
-        cur.execute("REPLACE INTO files (path, mime, size, modification_date, error_msg) VALUES (?, ?, ?, ?, ?);", self.to_sqlite_tuple())
+        cur.execute("REPLACE INTO files (path, mime, size, modification_date, extra, error_msg) VALUES (?, ?, ?, ?, ?, ?);", self.to_sqlite_tuple())
 
     @staticmethod
     def create_table(cur: sqlite3.Cursor):
-        cur.execute("CREATE TABLE IF NOT EXISTS files (path PRIMARY KEY, mime, size, modification_date, error_msg);")
+        cur.execute("CREATE TABLE IF NOT EXISTS files (path PRIMARY KEY, mime, size, modification_date, extra, error_msg);")
 
 @dataclass
 class Directory(FileNode):
@@ -149,37 +187,57 @@ class Directory(FileNode):
         return True
 
     def to_sqlite_tuple(self) -> Tuple:
-        return (str(self.path), self.num_children, self.modification_date, self.error_msg)
+        return (str(self.path), self.num_children, self.modification_date, self.extra, self.error_msg)
 
     def save(self, cur: sqlite3.Cursor):
-        cur.execute("REPLACE INTO directories (path, num_children, modification_date, error_msg) VALUES (?, ?, ?, ?);", self.to_sqlite_tuple())
+        cur.execute("REPLACE INTO directories (path, num_children, modification_date, extra, error_msg) VALUES (?, ?, ?, ?, ?);", self.to_sqlite_tuple())
 
     @staticmethod
     def load(directory: PurePosixPath, cur: sqlite3.Cursor) -> Optional[Directory]:
-        res = cur.execute("SELECT path, num_children, modification_date, error_msg FROM directories WHERE path = ?", (str(directory),))
+        res = cur.execute("SELECT path, num_children, modification_date, extra, error_msg FROM directories WHERE path = ?", (str(directory),))
         line = res.fetchone()
         if line is None:
             return None
         else:
-            return Directory(path=line[0], num_children=line[1], modification_date=line[2], error_msg=line[3])
+            return Directory(path=line[0], num_children=line[1], modification_date=line[2], extra=line[3], error_msg=line[4])
 
     @staticmethod
     def create_table(cur: sqlite3.Cursor):
-        cur.execute("CREATE TABLE IF NOT EXISTS directories (path PRIMARY KEY, num_children, modification_date, error_msg);")
+        cur.execute("CREATE TABLE IF NOT EXISTS directories (path PRIMARY KEY, num_children, modification_date, extra, error_msg);")
 
 class FTPScanner:
     ftp: FTP
     con: sqlite3.Connection
     flavour: Optional[FTPFlavour]
 
-    def __init__(self, ftp_addr: str, password: str, sqlite_path: str|Path, encoding: str="utf8"):
+    def __init__(self, ftp_addr: str, sqlite_path: str|Path, username: str=None, password: str=None, /,  source_address: Optional[Tuple[str, int]]=None, timeout: Optional[int]=None, encoding: str="utf8", flavour: Optional[FTPFlavour]=None):
+        self.flavour = flavour
         addr = urlparse(ftp_addr, scheme='ftp')
         if addr.netloc == '':
             addr = addr._replace(netloc=addr.path, path='')
+        if username is not None:
+            addr = addr._replace(username=username)
+        elif addr.username is not None:
+            username = addr.username
+        if password is None and addr.password is not None:
+            password = addr.password
+
         logger.info(f"Connecting to {urlunparse(addr)}")
-        self.ftp = FTP(addr.netloc, addr.username, password, encoding=encoding)
-        logger.info(f"Logging as {addr.username}")
-        self.ftp.login()
+        logger.debug(addr)
+        netloc = addr.hostname
+        netloc += f':{addr.port}' if addr.port is not None else ''
+        if addr.scheme == 'ftp':
+            self.ftp = FTP(netloc, username, password, encoding=encoding, source_address=source_address, timeout=timeout)
+        elif addr.scheme == 'sftp':
+            self.ftp = FTP_TLS(netloc, username, password, encoding=encoding, source_address=source_address, timeout=timeout)
+        else:
+            raise ValueError(f'not an FTP scheme: {addr.scheme}')
+
+        logger.info(f"Logging in as {username}")
+        if addr.scheme == 'ftp':
+            self.ftp.login()
+        if addr.scheme == 'sftp':
+            self.ftp.prot_p()
         logger.info(f"opening SQLite database at {sqlite_path}")
         self.con = sqlite3.connect(sqlite_path)
 
@@ -199,27 +257,40 @@ class FTPScanner:
         logger.info(f"FTP welcome message: {welcome_msg}")
         cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("welcome_msg", welcome_msg))
 
-        msg = self.ftp.sendcmd("STAT")
-        logger.debug(f"FTP STAT output: {msg}")
-        cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("STAT", msg))
+        try:
+            msg = self.ftp.sendcmd("STAT")
+            logger.debug(f"FTP STAT output: {msg}")
+            cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("STAT", msg))
+        except Exception as e:
+            logger.warning(f'Failed to run STAT command: {str(e)}')
 
-        msg = self.ftp.sendcmd("HELP")
-        logger.debug(f"FTP HELP output: {msg}")
-        cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("HELP", msg))
+        try:
+            msg = self.ftp.sendcmd("HELP")
+            logger.debug(f"FTP HELP output: {msg}")
+            cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("HELP", msg))
+            if re.findall(r"\bMLSD\b", msg) and self.flavour is None:
+                logger.debug("Changing FTP flavour to MLSD")
+                self.flavour = FTPFlavour.Mlsd
+        except Exception as e:
+            logger.warning(f'Failed to run HELP command: {str(e)}')
 
-        msg = self.ftp.sendcmd("FEAT")
-        logger.debug(f"FTP FEAT output: {msg}")
-        cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("FEAT", msg))
+        try:
+            msg = self.ftp.sendcmd("FEAT")
+            logger.debug(f"FTP FEAT output: {msg}")
+            cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("FEAT", msg))
+        except Exception as e:
+            logger.warning(f'Failed to run STAT command: {str(e)}')
 
         msg = self.ftp.sendcmd("SYST")
         logger.info(f"FTP SYST output: {msg}")
         cur.execute("REPLACE INTO general (key, value) VALUES (?, ?)", ("SYST", msg))
-        if "Windows_NT" in msg:
-            self.flavour = FTPFlavour.MsDos
-        elif "UNIX" in msg:
-            self.flavour = FTPFlavour.Unix
-        else:
-            raise ValueError(f"Unknown flavour {msg}")
+        if self.flavour is None:
+            if "Windows_NT" in msg or "Win32NT" in msg:
+                self.flavour = FTPFlavour.MsDos
+            elif "UNIX" in msg:
+                self.flavour = FTPFlavour.Unix
+            else:
+                raise ValueError(f"Unknown flavour {msg}")
 
         cur.close()
         self.con.commit()
@@ -234,26 +305,43 @@ class FTPScanner:
             try:
                 logger.info(f'Scanning {str(directory)}')
                 self.ftp.cwd(str(directory))
-                dir_listing = []
-                self.ftp.retrlines('LIST', dir_listing.append)
 
-                this_dir.num_children = len(dir_listing)
-                this_dir.save(cur)
+                if self.flavour == FTPFlavour.Mlsd:
+                    dir_listing = self.ftp.mlsd()
+                    new_node_func = FileNode.new_from_mlsd_line
+                else:
+                    dir_listing = []
+                    self.ftp.retrlines('LIST', dir_listing.append)
+                    new_node_func = FileNode.new_from_dir_line
+                    this_dir.num_children = len(dir_listing)
+                    this_dir.save(cur)
 
                 output: List[FileNode] = []
+                n_entries = 0
                 for line in dir_listing:
+                    n_entries += 1
                     try:
-                        node: FileNode = FileNode.new_from_dir_line(self.flavour, directory, line)
-                        # logger.debug(node)
-                        node.save(cur)
-                        output.append(node)
+                        node: FileNode = new_node_func(self.flavour, directory, line)
+                        if node is not None:
+                            node.save(cur)
+                            output.append(node)
                     except Exception as e:
                         logger.opt(exception=True).error(f'Failed to parse entry line {line!r}: {str(e)}')
+
+                if self.flavour == FTPFlavour.Mlsd:
+                    this_dir.num_children = n_entries
+                    this_dir.save(cur)
+
                 cur.close()
                 self.con.commit()
                 return output
             except ftplib.error_perm as e:
-                logger.warning(f'No permission to scan {str(directory)}')
+                logger.warning(f'No permission to scan {str(directory)}: {str(e)}')
+                this_dir.error_msg = str(e)
+                this_dir.save(cur)
+                return []
+            except TimeoutError as e:
+                logger.warning(f'Timeout while scanning {str(directory)}: {str(e)}')
                 this_dir.error_msg = str(e)
                 this_dir.save(cur)
                 return []
