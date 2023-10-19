@@ -8,14 +8,19 @@ from datetime import datetime
 from enum import StrEnum
 from ftplib import FTP, FTP_TLS
 import ftplib
+from functools import partial
 import json
 import mimetypes
+import os
 from pathlib import Path, PurePosixPath
+from queue import Queue
+import select
+import threading
 from urllib.parse import urlparse, urlunparse
 import regex as re
 from loguru import logger
 import sqlite3
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Generator, Iterable, List, Optional, Tuple
 
 UnixDirRegex = re.compile(r"^(?<inode_type>\S)(?<permissions>(?:[r-][w-][xs-]){3})\s+[0-9]+\s(?<user>\S+)\s+(?<group>\S+)\s+(?<size>\S+)\s+(?<month>\w{3})\s+(?<day>\d{1,2})\s+((?<year>\d{4})|(?<hour>\d{1,2}):(?<minute>\d{1,2}))\s+(?<filename>.*\S)\s*$")
 
@@ -295,7 +300,30 @@ class FTPScanner:
         cur.close()
         self.con.commit()
 
-    def scan_dir(self, directory: PurePosixPath) -> List[FileNode]:
+    def _read_lines(self, command: str) -> Generator[str]:
+        q = Queue(maxsize=1)
+        JOB_DONE = object()
+        TIMEOUT = 30
+
+        def append_line(chunk):
+            q.put(chunk)
+
+        def task():
+            self.ftp.retrlines(command, callback=append_line)
+            q.put(JOB_DONE)
+
+        t = threading.Thread(target=task)
+        t.start()
+
+        while True:
+            chunk = q.get(timeout=TIMEOUT)
+            if chunk is JOB_DONE:
+                break
+            yield chunk
+
+        t.join()
+
+    def scan_dir(self, directory: PurePosixPath, report_every_n_entries=1000) -> List[FileNode]:
         with logger.contextualize(wd=directory):
             cur = self.con.cursor()
             this_dir = Directory.load(directory, cur)
@@ -310,16 +338,15 @@ class FTPScanner:
                     dir_listing = self.ftp.mlsd()
                     new_node_func = FileNode.new_from_mlsd_line
                 else:
-                    dir_listing = []
-                    self.ftp.retrlines('LIST', dir_listing.append)
+                    dir_listing = self._read_lines('LIST')
                     new_node_func = FileNode.new_from_dir_line
-                    this_dir.num_children = len(dir_listing)
-                    this_dir.save(cur)
 
                 output: List[FileNode] = []
                 n_entries = 0
                 for line in dir_listing:
                     n_entries += 1
+                    if n_entries >= report_every_n_entries and n_entries % report_every_n_entries == 0:
+                        logger.info(f'Processed {n_entries} in {directory} so far')
                     try:
                         node: FileNode = new_node_func(self.flavour, directory, line)
                         if node is not None:
@@ -328,9 +355,8 @@ class FTPScanner:
                     except Exception as e:
                         logger.opt(exception=True).error(f'Failed to parse entry line {line!r}: {str(e)}')
 
-                if self.flavour == FTPFlavour.Mlsd:
-                    this_dir.num_children = n_entries
-                    this_dir.save(cur)
+                this_dir.num_children = n_entries
+                this_dir.save(cur)
 
                 cur.close()
                 self.con.commit()
